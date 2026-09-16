@@ -10,7 +10,11 @@ namespace EmergentesProyecto
     {
         private readonly ILogger<Worker> _logger;
         private IMqttClient _client;
-        
+
+        // Espejo persistente de las ordenes (redundancia): _orderQueue sigue
+        // siendo la cola en memoria de uso normal, esto es la copia en disco
+        // para poder recuperar pendientes si el proceso se cae o reinicia.
+        private readonly OrdersQueueStore _ordersStore = new();
 
         // Estructuras de Datos (Equivalentes seguras para multihilo)
         private readonly ConcurrentDictionary<string, RoverState> _rovers = new();
@@ -37,6 +41,19 @@ namespace EmergentesProyecto
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
+            // Recuperacion de contingencia: si el proceso se cayo o reinicio
+            // con ordenes pendientes de despachar, las volvemos a cargar en
+            // _orderQueue antes de arrancar a procesar cualquier cosa nueva.
+            var pendientes = _ordersStore.LoadPending();
+            if (pendientes.Count > 0)
+            {
+                _logger.LogWarning("Recuperando {Count} ordenes pendientes desde SQLite tras reinicio.", pendientes.Count);
+                foreach (var orden in pendientes)
+                {
+                    _orderQueue.Enqueue(orden);
+                }
+            }
+
             var options = new MqttClientOptionsBuilder()
                 .WithTcpServer(BrokerIp, 1883)
                 .WithCredentials("admin_admin", "admin") // Usa admin_iot si ya lo creaste en RabbitMQ
@@ -159,7 +176,17 @@ namespace EmergentesProyecto
             var msgType = data["message_type"]?.ToString();
             if (msgType == "order.dispatch")
             {
-                _logger.LogInformation("Nueva orden {OrderId} encolada.", data["order_id"]?.ToString());
+                var orderId = data["order_id"]?.ToString();
+                _logger.LogInformation("Nueva orden {OrderId} encolada.", orderId);
+
+                // Espejo permanente: se guarda en SQLite antes de tocar la
+                // cola en memoria, para que quede a resguardo aunque el
+                // proceso se caiga un instante despues.
+                if (!string.IsNullOrEmpty(orderId))
+                {
+                    _ordersStore.Mirror(orderId, data.ToJsonString());
+                }
+
                 _orderQueue.Enqueue(data);
                 await ProcessQueueAsync();
             }
@@ -193,6 +220,14 @@ namespace EmergentesProyecto
 
                     var topicOrder = $"vehicles/{targetRover}/vehicle_order";
                     await PublishAsync(topicOrder, orderData.ToJsonString());
+
+                    // Ya se publico al rover: se marca como resuelta en el
+                    // espejo de SQLite, no hace falta reprocesarla si el
+                    // servicio se reinicia despues de este punto.
+                    if (!string.IsNullOrEmpty(orderId))
+                    {
+                        _ordersStore.MarkDone(orderId);
+                    }
                 }
             }
         }
